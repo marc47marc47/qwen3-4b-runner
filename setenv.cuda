@@ -1,0 +1,223 @@
+#!/usr/bin/env bash
+
+#set -euo pipefail
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+  echo "Use: source ./setenv.cuda"
+  exit 1
+fi
+
+to_windows_path() {
+  cygpath -aw "$1"
+}
+
+to_unix_path() {
+  cygpath -au "$1"
+}
+
+to_unix_path_list() {
+  cygpath -aup "$1"
+}
+
+find_cuda_root() {
+  local candidates=()
+  local version_hint="${CUDA_VERSION_HINT:-}"
+
+  if [[ -n "${CUDA_PATH:-}" ]]; then
+    candidates+=("${CUDA_PATH}")
+  fi
+
+  if [[ -n "${CUDA_HOME:-}" ]]; then
+    candidates+=("${CUDA_HOME}")
+  fi
+
+  if [[ -d "/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA" ]]; then
+    if [[ -n "${version_hint}" && -d "/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${version_hint}" ]]; then
+      candidates+=("/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v${version_hint}")
+    fi
+    while IFS= read -r path; do
+      candidates+=("${path}")
+    done < <(find "/c/Program Files/NVIDIA GPU Computing Toolkit/CUDA" -mindepth 1 -maxdepth 1 -type d | sort -Vr)
+  fi
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -x "${candidate}/bin/nvcc.exe" || -x "${candidate}/bin/nvcc" ]]; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+find_vsdevcmd() {
+  return 1
+}
+
+find_msvc_root() {
+  local bases=(
+    "/c/Program Files/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC"
+    "/c/Program Files/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+    "/c/Program Files (x86)/Microsoft Visual Studio/2022/Community/VC/Tools/MSVC"
+    "/c/Program Files (x86)/Microsoft Visual Studio/2022/BuildTools/VC/Tools/MSVC"
+  )
+
+  local base candidate
+  for base in "${bases[@]}"; do
+    if [[ -d "${base}" ]]; then
+      while IFS= read -r candidate; do
+        printf '%s\n' "${candidate}"
+        return 0
+      done < <(find "${base}" -mindepth 1 -maxdepth 1 -type d | sort -Vr)
+    fi
+  done
+
+  return 1
+}
+
+find_windows_sdk_ver() {
+  local sdk_include_root="/c/Program Files (x86)/Windows Kits/10/Include"
+  if [[ -d "${sdk_include_root}" ]]; then
+    while IFS= read -r candidate; do
+      printf '%s\n' "$(basename "${candidate}")"
+      return 0
+    done < <(find "${sdk_include_root}" -mindepth 1 -maxdepth 1 -type d | sort -Vr)
+  fi
+
+  return 1
+}
+
+prepend_path() {
+  local entry="$1"
+  case ":${PATH}:" in
+    *":${entry}:"*) ;;
+    *) export PATH="${entry}:${PATH}" ;;
+  esac
+}
+
+join_with_semicolon() {
+  local first=1
+  local item
+  for item in "$@"; do
+    if [[ -n "${item}" ]]; then
+      if [[ ${first} -eq 1 ]]; then
+        printf '%s' "${item}"
+        first=0
+      else
+        printf ';%s' "${item}"
+      fi
+    fi
+  done
+}
+
+set_cudarc_cuda_version() {
+  if ! command -v nvcc >/dev/null 2>&1; then
+    return 0
+  fi
+
+  local release
+  release="$(nvcc --version | sed -n 's/.*release \([0-9][0-9]*\.[0-9][0-9]*\).*/\1/p' | tail -n 1)"
+
+  case "${release}" in
+    13.2|13.3|13.4|13.5|13.6|13.7|13.8|13.9)
+      export CUDARC_CUDA_VERSION="13010"
+      echo "Using CUDARC_CUDA_VERSION=13010 for CUDA ${release}"
+      ;;
+    13.1)
+      export CUDARC_CUDA_VERSION="13010"
+      ;;
+    13.0)
+      export CUDARC_CUDA_VERSION="13000"
+      ;;
+    12.9)
+      export CUDARC_CUDA_VERSION="12090"
+      ;;
+    12.8)
+      export CUDARC_CUDA_VERSION="12080"
+      ;;
+  esac
+}
+
+CUDA_ROOT="$(find_cuda_root || true)"
+
+if [[ -z "${CUDA_ROOT}" ]]; then
+  echo "CUDA Toolkit not found."
+  echo "Install CUDA Toolkit first, then re-run: source ./setenv.cuda"
+  return 1
+fi
+
+export CUDA_PATH="${CUDA_ROOT}"
+export CUDA_HOME="${CUDA_ROOT}"
+export CUDA_ROOT="${CUDA_ROOT}"
+export CUDA_TOOLKIT_ROOT_DIR="${CUDA_ROOT}"
+
+case ":${PATH}:" in
+  *":${CUDA_ROOT}/bin:"*) ;;
+  *) export PATH="${CUDA_ROOT}/bin:${PATH}" ;;
+esac
+
+case ":${PATH}:" in
+  *":${CUDA_ROOT}/libnvvp:"*) ;;
+  *) export PATH="${CUDA_ROOT}/libnvvp:${PATH}" ;;
+esac
+
+MSVC_ROOT="$(find_msvc_root || true)"
+WINDOWS_SDK_VER="$(find_windows_sdk_ver || true)"
+WINDOWS_SDK_ROOT="/c/Program Files (x86)/Windows Kits/10"
+
+if [[ -n "${MSVC_ROOT}" ]]; then
+  prepend_path "${MSVC_ROOT}/bin/Hostx64/x64"
+  export VCToolsInstallDir="$(to_windows_path "${MSVC_ROOT}")\\"
+  export VCINSTALLDIR="$(to_windows_path "$(dirname "$(dirname "${MSVC_ROOT}")")")\\"
+fi
+
+if [[ -n "${WINDOWS_SDK_VER}" && -d "${WINDOWS_SDK_ROOT}" ]]; then
+  prepend_path "${WINDOWS_SDK_ROOT}/bin/${WINDOWS_SDK_VER}/x64"
+  export WindowsSdkDir="$(to_windows_path "${WINDOWS_SDK_ROOT}")\\"
+  export WindowsSDKVersion="${WINDOWS_SDK_VER}\\"
+  export WindowsSDKLibVersion="${WINDOWS_SDK_VER}\\"
+  export UCRTVersion="${WINDOWS_SDK_VER}"
+  export UniversalCRTSdkDir="$(to_windows_path "${WINDOWS_SDK_ROOT}")\\"
+fi
+if [[ -n "${MSVC_ROOT}" && -n "${WINDOWS_SDK_VER}" ]]; then
+  export INCLUDE="$(
+    join_with_semicolon \
+      "$(to_windows_path "${MSVC_ROOT}/include")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Include/${WINDOWS_SDK_VER}/ucrt")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Include/${WINDOWS_SDK_VER}/shared")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Include/${WINDOWS_SDK_VER}/um")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Include/${WINDOWS_SDK_VER}/winrt")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Include/${WINDOWS_SDK_VER}/cppwinrt")"
+  )"
+  export LIB="$(
+    join_with_semicolon \
+      "$(to_windows_path "${MSVC_ROOT}/lib/x64")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Lib/${WINDOWS_SDK_VER}/ucrt/x64")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/Lib/${WINDOWS_SDK_VER}/um/x64")"
+  )"
+  export LIBPATH="$(
+    join_with_semicolon \
+      "$(to_windows_path "${MSVC_ROOT}/lib/x64")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/UnionMetadata/${WINDOWS_SDK_VER}")" \
+      "$(to_windows_path "${WINDOWS_SDK_ROOT}/References/${WINDOWS_SDK_VER}")"
+  )"
+  export CL="/Zc:preprocessor ${CL:-}"
+fi
+
+
+if [[ -x "${CUDA_ROOT}/bin/nvcc.exe" ]]; then
+  export NVCC="${CUDA_ROOT}/bin/nvcc.exe"
+fi
+
+if command -v cl.exe >/dev/null 2>&1; then
+  export NVCC_CCBIN="$(command -v cl.exe)"
+fi
+
+set_cudarc_cuda_version
+
+
+echo 1echo "CUDA environment loaded from: ${CUDA_ROOT}"
+if command -v nvcc >/dev/null 2>&1; then
+  nvcc --version
+fi
