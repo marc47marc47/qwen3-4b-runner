@@ -1,11 +1,16 @@
 use anyhow::{Context, Result, bail};
 use candle_core::{DType, Device, Tensor};
+use candle_core::quantized::gguf_file;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::qwen2::{Config, ModelForCausalLM};
+use candle_transformers::models::quantized_qwen2::ModelWeights as QuantizedModelWeights;
 use candle_transformers::utils::apply_repeat_penalty;
 use clap::Parser;
 use hf_hub::api::sync::Api;
+use rustyline::config::{CompletionType, Config as RustylineConfig, EditMode};
+use rustyline::DefaultEditor;
+use rustyline::error::ReadlineError;
 use serde::Deserialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -13,7 +18,9 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-const DEFAULT_MODEL_ID: &str = "Qwen/Qwen2.5-7B-Instruct";
+const DEFAULT_MODEL_ID: &str = "Qwen/Qwen2.5-Coder-7B-Instruct";
+const DEFAULT_QUANTIZED_MODEL_ID: &str = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF";
+const DEFAULT_GGUF_FILE: &str = "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
 const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 
 #[derive(Debug, Parser)]
@@ -21,6 +28,15 @@ const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
 struct Args {
     #[arg(long, default_value = DEFAULT_MODEL_ID)]
     model: String,
+
+    #[arg(long, default_value = DEFAULT_QUANTIZED_MODEL_ID)]
+    quantized_model: String,
+
+    #[arg(long, default_value = DEFAULT_GGUF_FILE)]
+    gguf_file: String,
+
+    #[arg(long)]
+    quantized: bool,
 
     #[arg(long, default_value = DEFAULT_SYSTEM_PROMPT)]
     system: String,
@@ -46,6 +62,9 @@ struct Args {
     #[arg(long, default_value_t = 64)]
     repeat_last_n: usize,
 
+    #[arg(long, default_value_t = 4096)]
+    max_context: usize,
+
     #[arg(long, default_value_t = 299_792_458)]
     seed: u64,
 
@@ -56,6 +75,71 @@ struct Args {
 #[derive(Debug, Deserialize)]
 struct WeightsIndex {
     weight_map: std::collections::HashMap<String, String>,
+}
+
+enum LoadedModel {
+    Dense(ModelForCausalLM),
+    Quantized(QuantizedModelWeights),
+}
+
+impl LoadedModel {
+    fn forward(&mut self, input: &Tensor, index_pos: usize) -> candle_core::Result<Tensor> {
+        match self {
+            Self::Dense(model) => model.forward(input, index_pos),
+            Self::Quantized(model) => model.forward(input, index_pos),
+        }
+    }
+
+    fn forward_prompt(&mut self, input_ids: &[u32], index_pos: usize, device: &Device) -> Result<Tensor> {
+        match self {
+            Self::Dense(model) => {
+                let input = Tensor::new(input_ids, device)?.unsqueeze(0)?;
+                Ok(model.forward(&input, index_pos)?)
+            }
+            Self::Quantized(model) => {
+                if index_pos == 0 || input_ids.len() <= 1 {
+                    let input = Tensor::new(input_ids, device)?.unsqueeze(0)?;
+                    return Ok(model.forward(&input, index_pos)?);
+                }
+
+                let mut logits = None;
+                let mut pos = index_pos;
+                for token in input_ids {
+                    let input = Tensor::new(&[*token], device)?.unsqueeze(0)?;
+                    logits = Some(model.forward(&input, pos)?);
+                    pos += 1;
+                }
+                logits.context("quantized forward received empty prompt")
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+enum ModelSource {
+    Dense {
+        config: Config,
+        weights: Vec<PathBuf>,
+        dtype: DType,
+    },
+    Quantized {
+        gguf_path: PathBuf,
+    },
+}
+
+impl ModelSource {
+    fn load(&self, device: &Device) -> Result<LoadedModel> {
+        match self {
+            Self::Dense {
+                config,
+                weights,
+                dtype,
+            } => Ok(LoadedModel::Dense(load_model(config, weights, *dtype, device)?)),
+            Self::Quantized { gguf_path } => {
+                Ok(LoadedModel::Quantized(load_quantized_model(gguf_path, device)?))
+            }
+        }
+    }
 }
 
 fn main() -> Result<()> {
@@ -69,22 +153,40 @@ fn main() -> Result<()> {
 
     eprintln!("device: {device:?}");
     eprintln!("dtype: {dtype:?}");
-    eprintln!("model: {}", args.model);
+    eprintln!(
+        "model: {}",
+        if args.quantized {
+            &args.quantized_model
+        } else {
+            &args.model
+        }
+    );
 
-    let repo = Api::new()
-        .context("failed to create Hugging Face API client")?
-        .model(args.model.clone());
-
-    let config_path = repo.get("config.json").context("failed to fetch config.json")?;
-    let tokenizer_path = repo
+    let api = Api::new().context("failed to create Hugging Face API client")?;
+    let tokenizer_repo = api.model(args.model.clone());
+    let tokenizer_path = tokenizer_repo
         .get("tokenizer.json")
         .context("failed to fetch tokenizer.json")?;
-    let weight_paths = download_weight_files(&repo)
-        .with_context(|| format!("failed to fetch weights for {}", args.model))?;
-
-    let config = load_config(&config_path)?;
     let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(anyhow::Error::msg)?;
-    let mut model = load_model(&config, &weight_paths, dtype, &device)?;
+    let model_source = if args.quantized {
+        let repo = api.model(args.quantized_model.clone());
+        let gguf_path = repo
+            .get(&args.gguf_file)
+            .with_context(|| format!("failed to fetch gguf file {}", args.gguf_file))?;
+        ModelSource::Quantized { gguf_path }
+    } else {
+        let repo = api.model(args.model.clone());
+        let config_path = repo.get("config.json").context("failed to fetch config.json")?;
+        let weight_paths = download_weight_files(&repo)
+            .with_context(|| format!("failed to fetch weights for {}", args.model))?;
+        let config = load_config(&config_path)?;
+        ModelSource::Dense {
+            config,
+            weights: weight_paths,
+            dtype,
+        }
+    };
+    let mut model = model_source.load(&device)?;
 
     let eos_token = tokenizer.token_to_id("<|im_end|>");
     let mut logits_processor = LogitsProcessor::from_sampling(
@@ -100,6 +202,7 @@ fn main() -> Result<()> {
             &args,
             &tokenizer,
             &mut model,
+            &model_source,
             &mut logits_processor,
             eos_token,
             &device,
@@ -118,6 +221,7 @@ fn main() -> Result<()> {
             &args,
             &tokenizer,
             &mut model,
+            &model_source,
             &mut logits_processor,
             &mut state,
             &input_ids,
@@ -132,6 +236,7 @@ fn main() -> Result<()> {
 
 #[derive(Default)]
 struct ChatState {
+    turns: Vec<(String, String)>,
     tokens: Vec<u32>,
 }
 
@@ -182,29 +287,35 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>> {
 fn run_chat_loop(
     args: &Args,
     tokenizer: &Tokenizer,
-    model: &mut ModelForCausalLM,
+    model: &mut LoadedModel,
+    model_source: &ModelSource,
     logits_processor: &mut LogitsProcessor,
     eos_token: Option<u32>,
     device: &Device,
 ) -> Result<()> {
     let mut state = ChatState::new();
-    let mut line = String::new();
-    let mut first_turn = true;
+    let config = RustylineConfig::builder()
+        .edit_mode(EditMode::Vi)
+        .completion_type(CompletionType::List)
+        .build();
+    let mut editor =
+        DefaultEditor::with_config(config).context("failed to initialize line editor")?;
 
     println!("chat mode: type 'exit' or 'quit' to leave");
 
     loop {
-        print!("you> ");
-        io::stdout().flush().context("failed to flush stdout")?;
-        line.clear();
-        let bytes = io::stdin()
-            .read_line(&mut line)
-            .context("failed to read from stdin")?;
-        if bytes == 0 {
-            println!();
-            break;
-        }
-
+        let line = match editor.readline("you> ") {
+            Ok(line) => line,
+            Err(ReadlineError::Interrupted) => {
+                println!();
+                continue;
+            }
+            Err(ReadlineError::Eof) => {
+                println!();
+                break;
+            }
+            Err(err) => return Err(err).context("failed to read from line editor"),
+        };
         let user_input = line.trim();
         if user_input.is_empty() {
             continue;
@@ -212,13 +323,15 @@ fn run_chat_loop(
         if matches!(user_input, "exit" | "quit") {
             break;
         }
+        editor
+            .add_history_entry(user_input)
+            .context("failed to record input history")?;
 
-        let prompt = if first_turn {
+        let prompt = if state.turns.is_empty() && state.tokens.is_empty() {
             build_initial_prompt(&args.system, user_input)
         } else {
             build_turn_prompt(user_input)
         };
-        first_turn = false;
 
         let input_ids = encode_prompt(tokenizer, &prompt)?;
         print!("assistant> ");
@@ -227,6 +340,7 @@ fn run_chat_loop(
             args,
             tokenizer,
             model,
+            model_source,
             logits_processor,
             &mut state,
             &input_ids,
@@ -234,6 +348,7 @@ fn run_chat_loop(
             device,
             true,
         )?;
+        state.turns.push((user_input.to_string(), generated.clone()));
         if generated.is_empty() {
             println!();
         }
@@ -245,7 +360,8 @@ fn run_chat_loop(
 fn generate_reply(
     args: &Args,
     tokenizer: &Tokenizer,
-    model: &mut ModelForCausalLM,
+    model: &mut LoadedModel,
+    model_source: &ModelSource,
     logits_processor: &mut LogitsProcessor,
     state: &mut ChatState,
     input_ids: &[u32],
@@ -257,16 +373,27 @@ fn generate_reply(
         bail!("prompt produced no tokens");
     }
 
+    if state.tokens.len() + input_ids.len() + args.sample_len > args.max_context {
+        rebuild_state_for_current_turn(args, tokenizer, model, model_source, state, input_ids, device)?;
+    }
+
+    if state.tokens.len() + input_ids.len() > args.max_context {
+        bail!(
+            "prompt exceeds --max-context ({} tokens). Reduce prompt size or raise the limit.",
+            args.max_context
+        );
+    }
+
     eprintln!("prompt_tokens: {}", input_ids.len());
     eprintln!("sampling {} new tokens...", args.sample_len);
 
-    let prefill = Tensor::new(input_ids, device)?.unsqueeze(0)?;
-    let logits = model.forward(&prefill, state.tokens.len())?;
+    let logits = model.forward_prompt(input_ids, state.tokens.len(), device)?;
     let mut logits = logits.squeeze(0)?.squeeze(0)?;
     state.tokens.extend_from_slice(input_ids);
 
     let generated_start = state.tokens.len();
     let mut visible_text = String::new();
+    let mut streamed_tokens = Vec::new();
 
     for _ in 0..args.sample_len {
         let logits_with_penalty = if args.repeat_penalty > 1.0 {
@@ -283,12 +410,18 @@ fn generate_reply(
         }
 
         if stream {
-            let piece = tokenizer
-                .decode(&[next_token], false)
+            streamed_tokens.push(next_token);
+            let decoded = tokenizer
+                .decode(&streamed_tokens, true)
                 .map_err(anyhow::Error::msg)?;
-            print!("{piece}");
-            io::stdout().flush().context("failed to flush stdout")?;
-            visible_text.push_str(&piece);
+            let stable = stable_prefix(&decoded);
+            if let Some(suffix) = stable.strip_prefix(&visible_text) {
+                if !suffix.is_empty() {
+                    print!("{suffix}");
+                    io::stdout().flush().context("failed to flush stdout")?;
+                    visible_text.push_str(suffix);
+                }
+            }
         }
 
         let input = Tensor::new(&[next_token], device)?.unsqueeze(0)?;
@@ -310,6 +443,16 @@ fn generate_reply(
     };
 
     let generated = if stream {
+        let final_text = tokenizer
+            .decode(generated_tokens, true)
+            .map_err(anyhow::Error::msg)?;
+        if let Some(suffix) = final_text.strip_prefix(&visible_text) {
+            if !suffix.is_empty() {
+                print!("{suffix}");
+                io::stdout().flush().context("failed to flush stdout")?;
+                visible_text.push_str(suffix);
+            }
+        }
         println!();
         visible_text
     } else {
@@ -318,6 +461,83 @@ fn generate_reply(
             .map_err(anyhow::Error::msg)?
     };
     Ok(generated)
+}
+
+fn stable_prefix(text: &str) -> &str {
+    match text.find('\u{fffd}') {
+        Some(idx) => &text[..idx],
+        None => text,
+    }
+}
+
+fn rebuild_state_for_current_turn(
+    args: &Args,
+    tokenizer: &Tokenizer,
+    model: &mut LoadedModel,
+    model_source: &ModelSource,
+    state: &mut ChatState,
+    current_input_ids: &[u32],
+    device: &Device,
+) -> Result<()> {
+    let mut kept_turns = state.turns.clone();
+    let mut rebuilt_tokens = encode_prompt(
+        tokenizer,
+        &build_prompt_from_history(&args.system, &kept_turns, None),
+    )?;
+
+    while !kept_turns.is_empty()
+        && rebuilt_tokens.len() + current_input_ids.len() + args.sample_len > args.max_context
+    {
+        kept_turns.remove(0);
+        rebuilt_tokens = encode_prompt(
+            tokenizer,
+            &build_prompt_from_history(&args.system, &kept_turns, None),
+        )?;
+    }
+
+    if rebuilt_tokens.len() + current_input_ids.len() + args.sample_len > args.max_context {
+        rebuilt_tokens.clear();
+    }
+
+    *model = model_source.load(device)?;
+    state.turns = kept_turns;
+    state.tokens.clear();
+
+    if !rebuilt_tokens.is_empty() {
+        let _ = model.forward_prompt(rebuilt_tokens.as_slice(), 0, device)?;
+        state.tokens = rebuilt_tokens;
+    }
+
+    Ok(())
+}
+
+fn build_prompt_from_history(
+    system: &str,
+    turns: &[(String, String)],
+    current_user: Option<&str>,
+) -> String {
+    let mut prompt = String::new();
+    prompt.push_str("<|im_start|>system\n");
+    prompt.push_str(system);
+    prompt.push_str("<|im_end|>\n");
+
+    for (user, assistant) in turns {
+        prompt.push_str("<|im_start|>user\n");
+        prompt.push_str(user);
+        prompt.push_str("<|im_end|>\n");
+        prompt.push_str("<|im_start|>assistant\n");
+        prompt.push_str(assistant);
+        prompt.push_str("<|im_end|>\n");
+    }
+
+    if let Some(user) = current_user {
+        prompt.push_str("<|im_start|>user\n");
+        prompt.push_str(user);
+        prompt.push_str("<|im_end|>\n");
+        prompt.push_str("<|im_start|>assistant\n");
+    }
+
+    prompt
 }
 
 fn load_config(path: &Path) -> Result<Config> {
@@ -335,6 +555,15 @@ fn load_model(
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(weights, dtype, device) }
         .context("failed to memory-map safetensors weights")?;
     ModelForCausalLM::new(config, vb).context("failed to build qwen2 model")
+}
+
+fn load_quantized_model(path: &Path, device: &Device) -> Result<QuantizedModelWeights> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("failed to open gguf file {}", path.display()))?;
+    let content = gguf_file::Content::read(&mut file)
+        .with_context(|| format!("failed to read gguf metadata from {}", path.display()))?;
+    QuantizedModelWeights::from_gguf(content, &mut file, device)
+        .context("failed to build quantized qwen2 model")
 }
 
 fn download_weight_files(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf>> {

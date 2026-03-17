@@ -1,1 +1,1 @@
-cargo run --features cuda --
+cargo run --features cuda -- --quantized --chat

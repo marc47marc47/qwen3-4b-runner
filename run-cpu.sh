@@ -1,1 +1,1 @@
- cargo run -- --cpu 
+cargo run -- --cpu --quantized --chat
