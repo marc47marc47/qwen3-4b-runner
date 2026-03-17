@@ -3,8 +3,8 @@ use candle_core::{DType, Device, Tensor};
 use candle_core::quantized::gguf_file;
 use candle_nn::VarBuilder;
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use candle_transformers::models::qwen2::{Config, ModelForCausalLM};
-use candle_transformers::models::quantized_qwen2::ModelWeights as QuantizedModelWeights;
+use candle_transformers::models::qwen3::{Config, ModelForCausalLM};
+use candle_transformers::models::quantized_qwen3::ModelWeights as QuantizedModelWeights;
 use candle_transformers::utils::apply_repeat_penalty;
 use clap::Parser;
 use hf_hub::api::sync::Api;
@@ -18,10 +18,10 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
-const DEFAULT_MODEL_ID: &str = "Qwen/Qwen2.5-Coder-7B-Instruct";
-const DEFAULT_QUANTIZED_MODEL_ID: &str = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF";
-const DEFAULT_GGUF_FILE: &str = "qwen2.5-coder-7b-instruct-q4_k_m.gguf";
-const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful assistant.";
+const DEFAULT_MODEL_ID: &str = "Qwen/Qwen3-4B";
+const DEFAULT_QUANTIZED_MODEL_ID: &str = "Qwen/Qwen3-4B-GGUF";
+const DEFAULT_GGUF_FILE: &str = "Qwen3-4B-Q4_K_M.gguf";
+const DEFAULT_SYSTEM_PROMPT: &str = "You are a helpful coding assistant.";
 
 #[derive(Debug, Parser)]
 #[command(author, version, about)]
@@ -554,7 +554,7 @@ fn load_model(
 ) -> Result<ModelForCausalLM> {
     let vb = unsafe { VarBuilder::from_mmaped_safetensors(weights, dtype, device) }
         .context("failed to memory-map safetensors weights")?;
-    ModelForCausalLM::new(config, vb).context("failed to build qwen2 model")
+    ModelForCausalLM::new(config, vb).context("failed to build qwen3 model")
 }
 
 fn load_quantized_model(path: &Path, device: &Device) -> Result<QuantizedModelWeights> {
@@ -563,7 +563,7 @@ fn load_quantized_model(path: &Path, device: &Device) -> Result<QuantizedModelWe
     let content = gguf_file::Content::read(&mut file)
         .with_context(|| format!("failed to read gguf metadata from {}", path.display()))?;
     QuantizedModelWeights::from_gguf(content, &mut file, device)
-        .context("failed to build quantized qwen2 model")
+        .context("failed to build quantized qwen3 model")
 }
 
 fn download_weight_files(repo: &hf_hub::api::sync::ApiRepo) -> Result<Vec<PathBuf>> {
